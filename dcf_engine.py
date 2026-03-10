@@ -8,6 +8,8 @@ Revenue → EBITDA (via COGS & SG&A margins) → EBIT (via D&A from CapEx intens
 → enterprise value → equity value → price per share.
 """
 
+from dataclasses import dataclass
+
 import numpy as np
 from numpy.typing import NDArray
 
@@ -178,6 +180,37 @@ DEFAULT_SPECS: list[DistributionSpec] = [
 ]
 
 PARAM_NAMES = [s.name for s in DEFAULT_SPECS]
+
+
+@dataclass(frozen=True)
+class ProjectionShockSpec:
+    """Configuration for one stochastic driver in the imported DCF model."""
+
+    name: str
+    label: str
+    kind: str
+    spread: float
+    low: float
+    high: float
+    applies_per_year: bool = True
+
+
+DEFAULT_PROJECTION_SPECS: list[ProjectionShockSpec] = [
+    ProjectionShockSpec("revenue", "Revenue", "relative", 0.05, 0.25, 2.50, True),
+    ProjectionShockSpec("cogs_pct", "COGS %", "additive", 0.020, 0.05, 0.95, True),
+    ProjectionShockSpec("sga_pct", "SG&A %", "additive", 0.015, 0.01, 0.60, True),
+    ProjectionShockSpec("da_pct", "D&A %", "additive", 0.010, 0.00, 0.25, True),
+    ProjectionShockSpec("tax_rate", "Tax Rate", "additive", 0.015, 0.00, 0.45, True),
+    ProjectionShockSpec("capex", "CapEx", "relative", 0.080, 0.00, 3.00, True),
+    ProjectionShockSpec("nwc", "Change in NWC", "relative", 0.100, 0.00, 3.00, True),
+    ProjectionShockSpec("wacc", "WACC", "additive", 0.015, 0.04, 0.20, False),
+    ProjectionShockSpec("exit_multiple", "Exit Multiple", "additive", 3.000, 4.00, 25.00, False),
+    ProjectionShockSpec("terminal_g", "Terminal Growth", "additive", 0.010, 0.005, 0.05, False),
+]
+
+PROJECTION_SPEC_MAP = {spec.name: spec for spec in DEFAULT_PROJECTION_SPECS}
+PROJECTION_PARAM_NAMES = [spec.name for spec in DEFAULT_PROJECTION_SPECS]
+PROJECTION_PARAM_LABELS = {spec.name: spec.label for spec in DEFAULT_PROJECTION_SPECS}
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +384,106 @@ def run_monte_carlo_vectorized(
 # Phase 7 — Projection-Based DCF (Year-by-Year from Excel)
 # ---------------------------------------------------------------------------
 
+def build_projection_correlation_matrix(
+    specs: list[ProjectionShockSpec] | None = None,
+) -> NDArray:
+    """Correlation matrix for imported-driver shocks."""
+    if specs is None:
+        specs = DEFAULT_PROJECTION_SPECS
+
+    names = [spec.name for spec in specs]
+    rho = np.eye(len(names))
+    idx = {name: i for i, name in enumerate(names)}
+
+    def _set(a: str, b: str, value: float) -> None:
+        if a in idx and b in idx:
+            rho[idx[a], idx[b]] = value
+            rho[idx[b], idx[a]] = value
+
+    _set("revenue", "wacc", 0.25)
+    _set("revenue", "exit_multiple", 0.15)
+    _set("cogs_pct", "sga_pct", 0.25)
+    _set("da_pct", "capex", 0.30)
+    _set("wacc", "exit_multiple", -0.35)
+    _set("wacc", "terminal_g", 0.15)
+
+    return rho
+
+
+def _coerce_projection_specs(
+    specs: list[ProjectionShockSpec] | None,
+) -> list[ProjectionShockSpec]:
+    if specs is None:
+        return DEFAULT_PROJECTION_SPECS
+    return specs
+
+
+def _projection_base_values(dcf_data: dict) -> dict[str, NDArray | float]:
+    arrays = dcf_data["arrays"]
+    revenue = np.asarray(arrays["Revenue"], dtype=float)
+    denom = np.maximum(revenue, 1e-9)
+
+    return {
+        "revenue": revenue,
+        "cogs_pct": np.asarray(arrays["COGS"], dtype=float) / denom,
+        "sga_pct": np.asarray(arrays["SG&A"], dtype=float) / denom,
+        "da_pct": np.asarray(arrays["D&A"], dtype=float) / denom,
+        "tax_rate": np.asarray(arrays["Tax Rate"], dtype=float),
+        "capex": np.asarray(arrays["CapEx"], dtype=float),
+        "nwc": np.asarray(arrays["Chg in NWC"], dtype=float),
+        "wacc": float(dcf_data["wacc"]),
+        "exit_multiple": float(dcf_data["exit_multiple"]),
+        "terminal_g": float(dcf_data["terminal_g"]),
+    }
+
+
+def _apply_projection_shock(
+    base: NDArray | float,
+    z: NDArray,
+    spec: ProjectionShockSpec,
+) -> NDArray:
+    if spec.kind == "relative":
+        factor = np.clip(1.0 + spec.spread * z, spec.low, spec.high)
+        return np.asarray(base, dtype=float) * factor
+    if spec.kind == "additive":
+        return np.clip(np.asarray(base, dtype=float) + spec.spread * z, spec.low, spec.high)
+    raise ValueError(f"Unknown projection shock kind: {spec.kind}")
+
+
+def _projection_dcf_from_draws(
+    dcf_data: dict,
+    draws: dict[str, NDArray],
+) -> NDArray:
+    revenue = draws["revenue"]
+    cogs = revenue * draws["cogs_pct"]
+    sga = revenue * draws["sga_pct"]
+    da = revenue * draws["da_pct"]
+
+    ebitda = revenue - cogs - sga
+    ebit = ebitda - da
+    nopat = ebit * (1 - draws["tax_rate"])
+    fcff = nopat + da - draws["capex"] - draws["nwc"]
+
+    n_years = revenue.shape[1]
+    discount_exp = np.arange(1, n_years + 1)[np.newaxis, :]
+    discount_factors = (1 + draws["wacc"][:, np.newaxis]) ** discount_exp
+    pv_fcff = np.sum(fcff / discount_factors, axis=1)
+
+    last_ebitda = ebitda[:, -1]
+    last_fcff = fcff[:, -1]
+    tv_exit = last_ebitda * draws["exit_multiple"]
+    tv_perp = last_fcff * (1 + draws["terminal_g"]) / (draws["wacc"] - draws["terminal_g"])
+    tv = (
+        dcf_data["exit_multiple_weight"] * tv_exit
+        + (1 - dcf_data["exit_multiple_weight"]) * tv_perp
+    )
+    pv_tv = tv / discount_factors[:, -1]
+
+    ev = pv_fcff + pv_tv
+    equity = ev - dcf_data["net_debt"]
+    return equity / dcf_data["shares_outstanding"]
+
+
 def run_dcf_from_projections(
     fcff_array: NDArray,
     last_ebitda: float,
@@ -381,152 +514,101 @@ def run_dcf_from_projections(
     return equity / shares
 
 
+def run_base_dcf_from_imported_data(dcf_data: dict) -> float:
+    """Deterministic valuation of the imported DCF case with no stochastic shocks."""
+    base = _projection_base_values(dcf_data)
+    draws = {}
+    for name in ("revenue", "cogs_pct", "sga_pct", "da_pct", "tax_rate", "capex", "nwc"):
+        draws[name] = np.asarray(base[name], dtype=float)[np.newaxis, :]
+    for name in ("wacc", "exit_multiple", "terminal_g"):
+        draws[name] = np.array([float(base[name])], dtype=float)
+    return float(_projection_dcf_from_draws(dcf_data, draws)[0])
+
+
+def run_projection_family_scenario(
+    dcf_data: dict,
+    shock_vector: dict[str, float],
+    specs: list[ProjectionShockSpec] | None = None,
+) -> float:
+    """Deterministic valuation for one family-level shock scenario."""
+    specs = _coerce_projection_specs(specs or dcf_data.get("shock_specs"))
+    base = _projection_base_values(dcf_data)
+    draws: dict[str, NDArray] = {}
+
+    for spec in specs:
+        amplitude = float(shock_vector.get(spec.name, 0.0))
+        if spec.applies_per_year:
+            shocked = _apply_projection_shock(
+                base[spec.name],
+                np.full(dcf_data["n_years"], amplitude, dtype=float),
+                spec,
+            )
+            draws[spec.name] = np.asarray(shocked, dtype=float)[np.newaxis, :]
+        else:
+            shocked = _apply_projection_shock(base[spec.name], np.array([amplitude]), spec)
+            draws[spec.name] = np.asarray(shocked, dtype=float)
+
+    if draws["terminal_g"][0] >= draws["wacc"][0]:
+        return 0.0
+
+    return float(_projection_dcf_from_draws(dcf_data, draws)[0])
+
+
 def run_monte_carlo_from_projections(
     dcf_data: dict,
     n_iter: int = 50_000,
     seed: int = 42,
     rho: float = 0.6,
+    specs: list[ProjectionShockSpec] | None = None,
+    correlation: NDArray | None = None,
 ) -> NDArray:
     """
-    Monte Carlo with per-year shocks on the year-by-year P&L from Excel.
+    Monte Carlo over an imported DCF export.
 
-    Shock mechanics:
-    - revenue_shock[t]: multiplicative on revenue
-    - cogs_margin_shock[t]: additive on COGS/Revenue ratio
-    - sga_margin_shock[t]: additive on SG&A/Revenue ratio
-    - capex_shock[t]: multiplicative on CapEx
-    - nwc_shock[t]: multiplicative on NWC change
-
-    AR(1) autocorrelation per line item across years.
-    Cross-line-item correlation via Cholesky on innovation terms.
+    The detailed DCF stays in Excel. This layer perturbs the exported yearly
+    drivers and re-runs the valuation.
     """
-    arrays = dcf_data["arrays"]
+    specs = _coerce_projection_specs(specs or dcf_data.get("shock_specs"))
+    if correlation is None:
+        correlation = build_projection_correlation_matrix(specs)
+
+    base = _projection_base_values(dcf_data)
     n_years = dcf_data["n_years"]
-
-    # Base arrays (absolute values for negative items)
-    revenue_base = arrays["Revenue"]
-    cogs_base = np.abs(arrays["COGS"])
-    sga_base = np.abs(arrays["SG&A"])
-    da_base = np.abs(arrays["D&A"])
-    capex_base = np.abs(arrays["CapEx"])
-    nwc_base = arrays["Chg in NWC"]  # keep sign
-
-    # Back-calculate implied margins per year
-    cogs_pct_base = cogs_base / revenue_base
-    sga_pct_base = sga_base / revenue_base
-    da_pct_base = da_base / revenue_base
-    tax_rate_base = np.abs(arrays["Taxes"]) / np.maximum(np.abs(arrays["EBIT"]), 1e-6)
-
-    # Scalar assumptions
-    wacc_base = dcf_data["wacc"]
-    em_base = dcf_data["exit_multiple"]
-    tg_base = dcf_data["terminal_g"]
-    net_debt = dcf_data["net_debt"]
-    shares = dcf_data["shares_outstanding"]
-    em_weight = dcf_data["exit_multiple_weight"]
-
-    # Shock std devs (reasonable defaults)
-    sigma_rev = 0.05       # 5% revenue shock
-    sigma_cogs = 0.02      # 2pp COGS margin shock
-    sigma_sga = 0.015      # 1.5pp SG&A margin shock
-    sigma_capex = 0.08     # 8% CapEx shock
-    sigma_nwc = 0.10       # 10% NWC shock
-    sigma_wacc = 0.015
-    sigma_em = 3.0
-    sigma_tg = 0.01
-
-    # Cross-item correlation matrix for innovations (5 per-year items + 3 scalars)
-    n_items = 5  # per-year shock channels
-    n_scalars = 3  # wacc, exit_multiple, terminal_g
-    n_total = n_items + n_scalars
-
-    corr = np.eye(n_total)
-    # indices: 0=rev, 1=cogs, 2=sga, 3=capex, 4=nwc, 5=wacc, 6=em, 7=tg
-    corr[1, 2] = corr[2, 1] = 0.20   # cogs ↔ sga
-    corr[0, 5] = corr[5, 0] = 0.25   # rev ↔ wacc
-    corr[5, 6] = corr[6, 5] = -0.30  # wacc ↔ exit multiple
-    corr[5, 7] = corr[7, 5] = 0.15   # wacc ↔ terminal g
-
-    L = np.linalg.cholesky(corr)
+    n_params = len(specs)
+    path_specs = [spec for spec in specs if spec.applies_per_year]
+    scalar_specs = [spec for spec in specs if not spec.applies_per_year]
+    n_path = len(path_specs)
 
     rng = np.random.default_rng(seed)
     rho_decay = np.sqrt(1 - rho ** 2)
+    L = np.linalg.cholesky(correlation)
+    z_raw = rng.standard_normal((n_iter, n_years, n_params))
+    z_corr = z_raw @ L.T
 
-    # Draw all innovations: (n_iter, n_years, n_items) for per-year + (n_iter, n_scalars) for scalars
-    # We draw (n_iter, n_years, n_total) and correlate across the last axis
-    z_raw = rng.standard_normal((n_iter, n_years, n_total))
-    z_corr = z_raw @ L.T  # (n_iter, n_years, n_total)
-
-    # Apply AR(1) to per-year items (first n_items channels)
-    shocks = np.zeros((n_iter, n_years, n_items))
+    path_z = np.zeros((n_iter, n_years, n_path))
     for t in range(n_years):
+        innovations = z_corr[:, t, :n_path]
         if t == 0:
-            shocks[:, t, :] = z_corr[:, t, :n_items]
+            path_z[:, t, :] = innovations
         else:
-            shocks[:, t, :] = rho * shocks[:, t - 1, :] + rho_decay * z_corr[:, t, :n_items]
+            path_z[:, t, :] = rho * path_z[:, t - 1, :] + rho_decay * innovations
 
-    # Scalar shocks: average correlated innovations across years for stability
-    scalar_z = z_corr[:, 0, n_items:]  # (n_iter, 3) — use first year's draw
+    draws: dict[str, NDArray] = {}
+    for j, spec in enumerate(path_specs):
+        draws[spec.name] = _apply_projection_shock(base[spec.name], path_z[:, :, j], spec)
 
-    wacc_draw = np.clip(wacc_base + sigma_wacc * scalar_z[:, 0], 0.04, 0.20)
-    em_draw = np.clip(em_base + sigma_em * scalar_z[:, 1], 4.0, 25.0)
-    tg_draw = np.clip(tg_base + sigma_tg * scalar_z[:, 2], 0.005, 0.05)
+    for j, spec in enumerate(scalar_specs):
+        scalar_z = z_corr[:, 0, n_path + j]
+        draws[spec.name] = _apply_projection_shock(base[spec.name], scalar_z, spec)
 
-    # Hard rejection: terminal_g >= wacc
-    valid = tg_draw < wacc_draw
-    shocks = shocks[valid]
-    wacc_draw = wacc_draw[valid]
-    em_draw = em_draw[valid]
-    tg_draw = tg_draw[valid]
-    n_valid = valid.sum()
+    valid = draws["terminal_g"] < draws["wacc"]
+    for name, values in draws.items():
+        draws[name] = values[valid]
 
-    # Extract per-year shocks: (n_valid, n_years)
-    rev_shock = shocks[:, :, 0]
-    cogs_shock = shocks[:, :, 1]
-    sga_shock = shocks[:, :, 2]
-    capex_shock = shocks[:, :, 3]
-    nwc_shock = shocks[:, :, 4]
+    if not np.any(valid):
+        return np.array([], dtype=float)
 
-    # Build shocked P&L year by year — all vectorized across iterations
-    # Arrays: (n_valid, n_years)
-    revenue = revenue_base[np.newaxis, :] * (1 + sigma_rev * rev_shock)
-    cogs_pct = np.clip(cogs_pct_base[np.newaxis, :] + sigma_cogs * cogs_shock, 0.1, 0.95)
-    sga_pct = np.clip(sga_pct_base[np.newaxis, :] + sigma_sga * sga_shock, 0.01, 0.50)
-
-    cogs = revenue * cogs_pct
-    gross_profit = revenue - cogs
-    sga = revenue * sga_pct
-    ebitda = gross_profit - sga
-
-    da = revenue * da_pct_base[np.newaxis, :]
-    ebit = ebitda - da
-    taxes = np.abs(ebit) * tax_rate_base[np.newaxis, :]
-    nopat = ebit - taxes
-
-    capex = capex_base[np.newaxis, :] * (1 + sigma_capex * capex_shock)
-    nwc_change = nwc_base[np.newaxis, :] * (1 + sigma_nwc * nwc_shock)
-
-    fcff = nopat + da - capex - nwc_change
-
-    # Discount each year's FCFF
-    discount_exp = np.arange(1, n_years + 1)[np.newaxis, :]  # (1, n_years)
-    discount_factors = (1 + wacc_draw[:, np.newaxis]) ** discount_exp  # (n_valid, n_years)
-    pv_fcff = np.sum(fcff / discount_factors, axis=1)  # (n_valid,)
-
-    # Terminal value from last year
-    last_ebitda = ebitda[:, -1]
-    last_fcff = fcff[:, -1]
-
-    tv_exit = last_ebitda * em_draw
-    tv_perp = last_fcff * (1 + tg_draw) / (wacc_draw - tg_draw)
-    tv = em_weight * tv_exit + (1 - em_weight) * tv_perp
-    pv_tv = tv / (1 + wacc_draw) ** n_years
-
-    ev = pv_fcff + pv_tv
-    equity = ev - net_debt
-    prices = equity / shares
-
-    return prices
+    return _projection_dcf_from_draws(dcf_data, draws)
 
 
 # ---------------------------------------------------------------------------

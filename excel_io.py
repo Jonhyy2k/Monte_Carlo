@@ -5,9 +5,12 @@ Creates a dummy Excel workbook with an Inputs sheet.
 Provides read_inputs_from_excel() and write_results_to_excel().
 """
 
+from pathlib import Path
+
 import numpy as np
 import openpyxl
-from pathlib import Path
+
+from dcf_engine import DEFAULT_PROJECTION_SPECS, ProjectionShockSpec
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +59,26 @@ DCF_LINE_ITEMS = [
     "D&A", "EBIT", "Taxes", "NOPAT", "CapEx", "Chg in NWC", "FCFF",
 ]
 
+IMPORT_SHEET_CANDIDATES = ("ImportedDCF", "DCF")
+MC_ASSUMPTIONS_SHEET = "MC Assumptions"
+
+SERIES_ALIASES = {
+    "Revenue": ("revenue", "sales"),
+    "COGS": ("cogs", "cost of goods sold"),
+    "COGS %": ("cogs %", "cogs pct", "cogs percentage", "cost of goods sold %"),
+    "SG&A": ("sg&a", "sga", "selling general & administrative"),
+    "SG&A %": ("sg&a %", "sga %", "sg&a pct", "sga pct"),
+    "D&A": ("d&a", "da", "depreciation & amortization", "depreciation and amortization"),
+    "D&A %": ("d&a %", "da %", "d&a pct", "da pct"),
+    "Taxes": ("taxes", "cash taxes"),
+    "Tax Rate": ("tax rate", "effective tax rate"),
+    "EBIT": ("ebit",),
+    "CapEx": ("capex", "capital expenditures", "capital expenditure"),
+    "CapEx %": ("capex %", "capex pct", "capital expenditures %"),
+    "Chg in NWC": ("chg in nwc", "change in nwc", "delta nwc", "change in working capital"),
+    "FCFF": ("fcff", "free cash flow to firm"),
+}
+
 DCF_SCALAR_ASSUMPTIONS = {
     "WACC":                 0.10,
     "Exit Multiple":        12.0,
@@ -69,7 +92,7 @@ DCF_SCALAR_ASSUMPTIONS = {
 
 
 def _build_dcf_dummy_data(n_years: int = 5) -> dict[str, list[float]]:
-    """Build realistic year-by-year P&L→FCFF from defaults."""
+    """Build a small importable DCF export for the Monte Carlo layer."""
     rev_base = DEFAULTS["revenue_base"]
     g = DEFAULTS["revenue_growth"]
     cogs_pct = DEFAULTS["cogs_pct"]
@@ -108,7 +131,7 @@ def _build_dcf_dummy_data(n_years: int = 5) -> dict[str, list[float]]:
 
 
 def create_stub_excel(filepath: str = "model_inputs.xlsx") -> None:
-    """Create a dummy Excel file with Inputs and DCF sheets."""
+    """Create a dummy Excel file with an import sheet and Monte Carlo specs."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Inputs"
@@ -128,27 +151,24 @@ def create_stub_excel(filepath: str = "model_inputs.xlsx") -> None:
     ws.column_dimensions["A"].width = 25
     ws.column_dimensions["B"].width = 15
 
-    # ---- DCF sheet ----
+    # ---- Imported DCF export sheet ----
     n_years = int(DEFAULTS["projection_years"])
     dcf_data = _build_dcf_dummy_data(n_years)
     bold = openpyxl.styles.Font(bold=True)
 
-    dcf = wb.create_sheet("DCF")
-    # Row 1: headers
+    dcf = wb.create_sheet("ImportedDCF")
     dcf["A1"] = "Line Item"
     dcf["A1"].font = bold
     for c in range(n_years):
         cell = dcf.cell(row=1, column=c + 2, value=f"Year {c + 1}")
         cell.font = bold
 
-    # Rows 2–13: line items
     for r, item in enumerate(DCF_LINE_ITEMS, start=2):
         dcf.cell(row=r, column=1, value=item)
         for c, val in enumerate(dcf_data[item]):
             dcf.cell(row=r, column=c + 2, value=val)
 
-    # Row 15+: scalar assumptions
-    scalar_start = len(DCF_LINE_ITEMS) + 3  # row 15
+    scalar_start = len(DCF_LINE_ITEMS) + 3
     dcf.cell(row=scalar_start, column=1, value="Assumptions").font = bold
     for i, (key, val) in enumerate(DCF_SCALAR_ASSUMPTIONS.items()):
         r = scalar_start + 1 + i
@@ -159,13 +179,128 @@ def create_stub_excel(filepath: str = "model_inputs.xlsx") -> None:
     for c in range(n_years):
         dcf.column_dimensions[openpyxl.utils.get_column_letter(c + 2)].width = 14
 
+    # ---- Monte Carlo shock assumptions ----
+    mc = wb.create_sheet(MC_ASSUMPTIONS_SHEET)
+    headers = ["Driver", "Label", "Shock Kind", "Spread", "Low", "High", "Per Year?", "Description"]
+    for col, header in enumerate(headers, start=1):
+        mc.cell(row=1, column=col, value=header).font = bold
+
+    descriptions = {
+        "revenue": "Relative shock applied to imported revenue by year.",
+        "cogs_pct": "Additive margin shock to imported COGS / revenue.",
+        "sga_pct": "Additive margin shock to imported SG&A / revenue.",
+        "da_pct": "Additive margin shock to imported D&A / revenue.",
+        "tax_rate": "Additive shock to imported operating tax rate.",
+        "capex": "Relative shock applied to imported CapEx.",
+        "nwc": "Relative shock applied to imported change in NWC.",
+        "wacc": "Scalar shock to discount rate.",
+        "exit_multiple": "Scalar shock to exit multiple.",
+        "terminal_g": "Scalar shock to terminal growth.",
+    }
+    for row, spec in enumerate(DEFAULT_PROJECTION_SPECS, start=2):
+        mc.cell(row=row, column=1, value=spec.name)
+        mc.cell(row=row, column=2, value=spec.label)
+        mc.cell(row=row, column=3, value=spec.kind)
+        mc.cell(row=row, column=4, value=spec.spread)
+        mc.cell(row=row, column=5, value=spec.low)
+        mc.cell(row=row, column=6, value=spec.high)
+        mc.cell(row=row, column=7, value="Y" if spec.applies_per_year else "N")
+        mc.cell(row=row, column=8, value=descriptions.get(spec.name, ""))
+
+    for col in ("A", "B", "C", "D", "E", "F", "G", "H"):
+        mc.column_dimensions[col].width = 18 if col != "H" else 42
+
     wb.save(filepath)
     print(f"  Created stub: {filepath}")
 
 
+def _normalize_label(value) -> str:
+    return str(value).strip().lower() if value is not None else ""
+
+
+def _find_import_sheet_name(wb: openpyxl.Workbook) -> str | None:
+    for sheet_name in IMPORT_SHEET_CANDIDATES:
+        if sheet_name in wb.sheetnames:
+            return sheet_name
+    return None
+
+
+def _row_to_array(ws, row: int, n_years: int) -> np.ndarray:
+    values = []
+    for col in range(2, 2 + n_years):
+        cell_value = ws.cell(row=row, column=col).value
+        values.append(float(cell_value) if cell_value is not None else 0.0)
+    return np.array(values, dtype=float)
+
+
+def _lookup_series(row_map: dict[str, np.ndarray], canonical_name: str) -> np.ndarray | None:
+    for alias in SERIES_ALIASES.get(canonical_name, ()):
+        if alias in row_map:
+            return row_map[alias]
+    return None
+
+
+def _standardize_nwc(raw: np.ndarray) -> np.ndarray:
+    negatives = int(np.count_nonzero(raw < 0))
+    positives = int(np.count_nonzero(raw > 0))
+    if negatives >= positives:
+        return -raw
+    return raw
+
+
+def read_projection_specs_from_excel(filepath: str = "model_inputs.xlsx") -> list[ProjectionShockSpec]:
+    """Read stochastic shock specs from the workbook, falling back to defaults."""
+    wb = openpyxl.load_workbook(filepath, data_only=True)
+    if MC_ASSUMPTIONS_SHEET not in wb.sheetnames:
+        wb.close()
+        return list(DEFAULT_PROJECTION_SPECS)
+
+    ws = wb[MC_ASSUMPTIONS_SHEET]
+    specs: list[ProjectionShockSpec] = []
+    defaults = {spec.name: spec for spec in DEFAULT_PROJECTION_SPECS}
+
+    for row in range(2, ws.max_row + 1):
+        name = _normalize_label(ws.cell(row=row, column=1).value)
+        if not name:
+            continue
+        default = defaults.get(name)
+        if default is None:
+            continue
+
+        kind = str(ws.cell(row=row, column=3).value or default.kind).strip().lower()
+        spread = ws.cell(row=row, column=4).value
+        low = ws.cell(row=row, column=5).value
+        high = ws.cell(row=row, column=6).value
+        per_year_value = _normalize_label(ws.cell(row=row, column=7).value)
+        applies_per_year = per_year_value in {"y", "yes", "true", "1"}
+
+        specs.append(
+            ProjectionShockSpec(
+                name=default.name,
+                label=str(ws.cell(row=row, column=2).value or default.label),
+                kind=kind,
+                spread=float(spread) if spread is not None else default.spread,
+                low=float(low) if low is not None else default.low,
+                high=float(high) if high is not None else default.high,
+                applies_per_year=applies_per_year,
+            )
+        )
+
+    wb.close()
+
+    if not specs:
+        return list(DEFAULT_PROJECTION_SPECS)
+
+    spec_map = {spec.name: spec for spec in specs}
+    ordered = []
+    for default in DEFAULT_PROJECTION_SPECS:
+        ordered.append(spec_map.get(default.name, default))
+    return ordered
+
+
 def read_dcf_from_excel(filepath: str = "model_inputs.xlsx") -> dict:
     """
-    Read the DCF sheet → dict with numpy arrays keyed by line item + scalars.
+    Read the imported DCF export sheet → standardized yearly arrays + scalars.
 
     Returns
     -------
@@ -177,31 +312,29 @@ def read_dcf_from_excel(filepath: str = "model_inputs.xlsx") -> dict:
         "exit_multiple_weight" → floats
     """
     wb = openpyxl.load_workbook(filepath, data_only=True)
-    dcf = wb["DCF"]
+    sheet_name = _find_import_sheet_name(wb)
+    if sheet_name is None:
+        wb.close()
+        raise KeyError("Workbook does not contain an ImportedDCF or DCF sheet")
+    dcf = wb[sheet_name]
 
-    # Detect number of year columns (row 1, starting col B)
     n_years = 0
     for c in range(2, 50):
         if dcf.cell(row=1, column=c).value is None:
             break
         n_years += 1
 
-    # Read line items (rows 2+)
-    arrays = {}
+    row_map = {}
     row = 2
     while True:
         label = dcf.cell(row=row, column=1).value
-        if label is None or label == "Assumptions":
+        normalized = _normalize_label(label)
+        if label is None or normalized == "assumptions":
             break
-        if label in DCF_LINE_ITEMS:
-            vals = []
-            for c in range(2, 2 + n_years):
-                v = dcf.cell(row=row, column=c).value
-                vals.append(float(v) if v is not None else 0.0)
-            arrays[label] = np.array(vals)
+        if normalized:
+            row_map[normalized] = _row_to_array(dcf, row, n_years)
         row += 1
 
-    # Read scalar assumptions below the line items
     scalar_map = {
         "WACC": "wacc",
         "Exit Multiple": "exit_multiple",
@@ -219,19 +352,69 @@ def read_dcf_from_excel(filepath: str = "model_inputs.xlsx") -> dict:
             val = dcf.cell(row=r, column=2).value
             scalars[scalar_map[label]] = float(val) if val is not None else DCF_SCALAR_ASSUMPTIONS[label]
 
-    # Fill defaults for missing scalars
     for excel_name, key in scalar_map.items():
         if key not in scalars:
             scalars[key] = DCF_SCALAR_ASSUMPTIONS[excel_name]
 
+    revenue = _lookup_series(row_map, "Revenue")
+    if revenue is None:
+        wb.close()
+        raise KeyError("Imported DCF sheet must include a Revenue row")
+    revenue = np.asarray(revenue, dtype=float)
+
+    def _expense_or_ratio(expense_name: str, ratio_name: str) -> np.ndarray:
+        absolute = _lookup_series(row_map, expense_name)
+        ratio = _lookup_series(row_map, ratio_name)
+        if absolute is not None:
+            return np.abs(absolute)
+        if ratio is not None:
+            return revenue * np.clip(np.asarray(ratio, dtype=float), 0.0, 2.0)
+        raise KeyError(f"Imported DCF sheet is missing {expense_name} or {ratio_name}")
+
+    cogs = _expense_or_ratio("COGS", "COGS %")
+    sga = _expense_or_ratio("SG&A", "SG&A %")
+    da = _expense_or_ratio("D&A", "D&A %")
+    capex = _expense_or_ratio("CapEx", "CapEx %")
+
+    tax_rate = _lookup_series(row_map, "Tax Rate")
+    if tax_rate is None:
+        taxes = _lookup_series(row_map, "Taxes")
+        ebit = _lookup_series(row_map, "EBIT")
+        if taxes is None or ebit is None:
+            tax_rate = np.full(n_years, DEFAULTS["tax_rate"], dtype=float)
+        else:
+            tax_rate = np.clip(np.abs(taxes) / np.maximum(np.abs(ebit), 1e-9), 0.0, 0.45)
+    else:
+        tax_rate = np.clip(np.asarray(tax_rate, dtype=float), 0.0, 0.45)
+
+    nwc_raw = _lookup_series(row_map, "Chg in NWC")
+    if nwc_raw is None:
+        nwc = np.zeros(n_years, dtype=float)
+    else:
+        nwc = np.asarray(_standardize_nwc(np.asarray(nwc_raw, dtype=float)), dtype=float)
+
     wb.close()
-    return {"arrays": arrays, "n_years": n_years, **scalars}
+    return {
+        "sheet_name": sheet_name,
+        "arrays": {
+            "Revenue": revenue,
+            "COGS": cogs,
+            "SG&A": sga,
+            "D&A": da,
+            "CapEx": capex,
+            "Chg in NWC": nwc,
+            "Tax Rate": tax_rate,
+        },
+        "n_years": n_years,
+        "shock_specs": read_projection_specs_from_excel(filepath),
+        **scalars,
+    }
 
 
 def has_dcf_sheet(filepath: str = "model_inputs.xlsx") -> bool:
-    """Check if the workbook contains a DCF sheet."""
+    """Check if the workbook contains an importable DCF sheet."""
     wb = openpyxl.load_workbook(filepath, read_only=True)
-    result = "DCF" in wb.sheetnames
+    result = _find_import_sheet_name(wb) is not None
     wb.close()
     return result
 

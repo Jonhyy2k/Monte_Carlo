@@ -9,11 +9,11 @@ import time
 import numpy as np
 
 from dcf_engine import (
-    run_monte_carlo_vectorized,
-    run_monte_carlo_from_projections,
     DistributionSpec,
     DEFAULT_SPECS,
-    PARAM_NAMES,
+    run_base_dcf_from_imported_data,
+    run_monte_carlo_from_projections,
+    run_monte_carlo_vectorized,
 )
 from sobol_analysis import run_sobol, run_sobol_projections
 from excel_io import (
@@ -74,11 +74,12 @@ def _run_simple_pipeline(excel_path, n_iter, sobol_samples):
 
 
 def _run_projection_pipeline(excel_path, n_iter, sobol_samples):
-    """Year-by-year projection pipeline from DCF sheet."""
-    print("Mode: Projection (year-by-year DCF from Excel)")
+    """Projection pipeline driven by an imported Excel DCF export."""
+    print("Mode: Imported DCF (year-by-year export from Excel)")
     dcf_data = read_dcf_from_excel(excel_path)
     print(f"  {dcf_data['n_years']} projection years, "
-          f"{len(dcf_data['arrays'])} line items from DCF sheet")
+          f"{len(dcf_data['arrays'])} imported driver series, "
+          f"{len(dcf_data['shock_specs'])} stochastic driver families")
 
     print(f"Running Monte Carlo ({n_iter:,} iterations)...")
     t0 = time.perf_counter()
@@ -91,6 +92,8 @@ def _run_projection_pipeline(excel_path, n_iter, sobol_samples):
 
     current_price = dcf_data.get("current_price", 55.0)
     fundamental_target = dcf_data.get("target_price", 68.0)
+    base_case = run_base_dcf_from_imported_data(dcf_data)
+    print(f"  Base imported DCF price: ${base_case:.2f}")
     return prices, sobol_df, elapsed, current_price, fundamental_target
 
 

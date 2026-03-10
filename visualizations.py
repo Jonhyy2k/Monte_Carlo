@@ -11,9 +11,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
-from scipy.stats import gaussian_kde
 
-from dcf_engine import run_monte_carlo_vectorized
+from dcf_engine import PROJECTION_PARAM_LABELS, run_monte_carlo_vectorized
 from sobol_analysis import run_sobol
 
 
@@ -40,6 +39,7 @@ PARAM_LABELS = {
     "terminal_g": "Terminal Growth",
     "wacc": "WACC",
 }
+PARAM_LABELS.update(PROJECTION_PARAM_LABELS)
 
 
 def _style_ax(ax: plt.Axes) -> None:
@@ -51,6 +51,22 @@ def _style_ax(ax: plt.Axes) -> None:
     for spine in ax.spines.values():
         spine.set_color(GRID_COLOR)
     ax.grid(axis="y", color=GRID_COLOR, linewidth=0.5, alpha=0.5)
+
+
+def _estimate_density(samples: np.ndarray, x: np.ndarray, bw_scale: float = 1.0) -> np.ndarray:
+    """Lightweight Gaussian KDE without SciPy to keep the pipeline self-contained."""
+    samples = np.asarray(samples, dtype=float)
+    if samples.size < 2:
+        return np.zeros_like(x)
+
+    std = np.std(samples, ddof=1)
+    if std <= 0:
+        return np.zeros_like(x)
+
+    bandwidth = max(1.06 * std * samples.size ** (-1 / 5) * bw_scale, 1e-6)
+    z = (x[:, np.newaxis] - samples[np.newaxis, :]) / bandwidth
+    kernel = np.exp(-0.5 * z ** 2) / np.sqrt(2 * np.pi)
+    return kernel.mean(axis=1) / bandwidth
 
 
 def plot_price_distribution(
@@ -76,9 +92,9 @@ def plot_price_distribution(
     )
 
     # KDE overlay
-    kde = gaussian_kde(display, bw_method=0.15)
     x = np.linspace(display.min(), display.max(), 500)
-    ax.plot(x, kde(x), color=ACCENT_GOLD, linewidth=2.5, label="KDE")
+    ax.plot(x, _estimate_density(display, x, bw_scale=0.8),
+            color=ACCENT_GOLD, linewidth=2.5, label="KDE")
 
     # Vertical markers
     sim_mean = np.mean(prices)
