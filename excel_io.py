@@ -5,12 +5,18 @@ Creates a dummy Excel workbook with an Inputs sheet.
 Provides read_inputs_from_excel() and write_results_to_excel().
 """
 
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import openpyxl
+from openpyxl.drawing.image import Image as ExcelImage
 
-from dcf_engine import DEFAULT_PROJECTION_SPECS, ProjectionShockSpec
+from dcf_engine import (
+    DEFAULT_PROJECTION_SPECS,
+    ProjectionShockSpec,
+    run_base_dcf_from_imported_data,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -55,17 +61,19 @@ DEFAULTS = {
 
 
 DCF_LINE_ITEMS = [
-    "Revenue", "COGS", "Gross Profit", "SG&A", "EBITDA",
+    "Revenue", "COGS", "Gross Profit", "R&D", "SG&A", "EBITDA",
     "D&A", "EBIT", "Taxes", "NOPAT", "CapEx", "Chg in NWC", "FCFF",
 ]
 
-IMPORT_SHEET_CANDIDATES = ("ImportedDCF", "DCF")
+IMPORT_SHEET_CANDIDATES = ("ImportedDCF", "DCF", "DCF Model")
 MC_ASSUMPTIONS_SHEET = "MC Assumptions"
 
 SERIES_ALIASES = {
     "Revenue": ("revenue", "sales"),
     "COGS": ("cogs", "cost of goods sold"),
     "COGS %": ("cogs %", "cogs pct", "cogs percentage", "cost of goods sold %"),
+    "R&D": ("r&d", "research & development", "research and development"),
+    "R&D %": ("r&d %", "r&d pct", "research & development %", "research and development %"),
     "SG&A": ("sg&a", "sga", "selling general & administrative"),
     "SG&A %": ("sg&a %", "sga %", "sg&a pct", "sga pct"),
     "D&A": ("d&a", "da", "depreciation & amortization", "depreciation and amortization"),
@@ -96,7 +104,8 @@ def _build_dcf_dummy_data(n_years: int = 5) -> dict[str, list[float]]:
     rev_base = DEFAULTS["revenue_base"]
     g = DEFAULTS["revenue_growth"]
     cogs_pct = DEFAULTS["cogs_pct"]
-    sga_pct = DEFAULTS["sga_pct"]
+    rd_pct = 0.07
+    sga_pct = max(DEFAULTS["sga_pct"] - rd_pct, 0.03)
     capex_pct = DEFAULTS["capex_intensity"]
     tax_rate = DEFAULTS["tax_rate"]
 
@@ -105,8 +114,9 @@ def _build_dcf_dummy_data(n_years: int = 5) -> dict[str, list[float]]:
         rev = rev_base * (1 + g) ** (t + 1)
         cogs = -rev * cogs_pct
         gross = rev + cogs
+        rd = -rev * rd_pct
         sga = -rev * sga_pct
-        ebitda = gross + sga
+        ebitda = gross + rd + sga
         da = -rev * capex_pct
         ebit = ebitda + da
         taxes = -(abs(ebit) * tax_rate)
@@ -118,6 +128,7 @@ def _build_dcf_dummy_data(n_years: int = 5) -> dict[str, list[float]]:
         data["Revenue"].append(round(rev, 1))
         data["COGS"].append(round(cogs, 1))
         data["Gross Profit"].append(round(gross, 1))
+        data["R&D"].append(round(rd, 1))
         data["SG&A"].append(round(sga, 1))
         data["EBITDA"].append(round(ebitda, 1))
         data["D&A"].append(round(da, 1))
@@ -131,7 +142,7 @@ def _build_dcf_dummy_data(n_years: int = 5) -> dict[str, list[float]]:
 
 
 def create_stub_excel(filepath: str = "model_inputs.xlsx") -> None:
-    """Create a dummy Excel file with an import sheet and Monte Carlo specs."""
+    """Create the legacy stub workbook used only when no real DCF workbook is present."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Inputs"
@@ -188,6 +199,7 @@ def create_stub_excel(filepath: str = "model_inputs.xlsx") -> None:
     descriptions = {
         "revenue": "Relative shock applied to imported revenue by year.",
         "cogs_pct": "Additive margin shock to imported COGS / revenue.",
+        "rd_pct": "Additive margin shock to imported R&D / revenue.",
         "sga_pct": "Additive margin shock to imported SG&A / revenue.",
         "da_pct": "Additive margin shock to imported D&A / revenue.",
         "tax_rate": "Additive shock to imported operating tax rate.",
@@ -316,6 +328,156 @@ def read_dcf_from_excel(filepath: str = "model_inputs.xlsx") -> dict:
     if sheet_name is None:
         wb.close()
         raise KeyError("Workbook does not contain an ImportedDCF or DCF sheet")
+    if sheet_name == "DCF Model":
+        ws_data = wb["DCF Model"]
+        op_data = wb["OP"]
+        wacc_data = wb["WACC"]
+        wb_formula = openpyxl.load_workbook(filepath, data_only=False)
+        ws = wb_formula["DCF Model"]
+        op = wb_formula["OP"]
+        wacc_ws = wb_formula["WACC"]
+        projected_cols = range(10, 15)  # J:N
+
+        def _require_float(value, label: str) -> float:
+            if isinstance(value, (int, float)):
+                return float(value)
+            raise ValueError(f"{label} must be a numeric value in the workbook")
+
+        def _maybe_float(value) -> float | None:
+            if isinstance(value, (int, float)):
+                return float(value)
+            return None
+
+        def _value(data_sheet, formula_sheet, ref: str, label: str) -> float:
+            data_value = data_sheet[ref].value
+            if isinstance(data_value, (int, float)):
+                return float(data_value)
+            return _require_float(formula_sheet[ref].value, label)
+
+        def _literal_series(row: int) -> list[float | None]:
+            values = []
+            for col in projected_cols:
+                data_value = ws_data.cell(row=row, column=col).value
+                formula_value = ws.cell(row=row, column=col).value
+                if isinstance(data_value, (int, float)):
+                    values.append(float(data_value))
+                elif isinstance(formula_value, (int, float)):
+                    values.append(float(formula_value))
+                else:
+                    values.append(None)
+            return values
+
+        def _filled_series(row: int, label: str) -> np.ndarray:
+            raw = _literal_series(row)
+            if any(value is None for value in raw):
+                raise ValueError(f"{label} projected assumptions must be numeric in DCF Model")
+            return np.array(raw, dtype=float)
+
+        hist_revenue = _value(ws_data, ws, "H7", "Historical revenue")
+        hist_growth_g = _value(ws_data, ws, "G8", "Historical growth (2024)")
+        hist_growth_h = _value(ws_data, ws, "H8", "Historical growth (2025)")
+
+        growth_inputs = _literal_series(8)
+        growth = np.empty(len(projected_cols), dtype=float)
+        growth[0] = growth_inputs[0] if growth_inputs[0] is not None else (hist_growth_g + hist_growth_h) / 2
+        for i in range(1, len(projected_cols)):
+            growth[i] = growth_inputs[i] if growth_inputs[i] is not None else growth[i - 1] + 0.005
+
+        revenue_inputs = _literal_series(7)
+        revenue = np.empty(len(projected_cols), dtype=float)
+        revenue[0] = revenue_inputs[0] if revenue_inputs[0] is not None else hist_revenue * (1 + growth[0])
+        for i in range(1, len(projected_cols)):
+            revenue[i] = revenue_inputs[i] if revenue_inputs[i] is not None else revenue[i - 1] * (1 + growth[i])
+
+        gross_margin = _filled_series(11, "Gross margin")
+        rd_pct = _filled_series(14, "R&D %")
+        sga_other_pct = _filled_series(17, "SG&A %")
+        da_pct = _filled_series(25, "D&A %")
+        capex_pct = _filled_series(31, "CapEx %")
+        nwc_pct = _filled_series(34, "Change in NWC % of delta revenue")
+        tax_rate = np.clip(_filled_series(42, "Tax rate"), 0.0, 0.45)
+
+        cogs = revenue * (1 - gross_margin)
+        rd = revenue * rd_pct
+        sga = revenue * sga_other_pct
+        da = revenue * da_pct
+        capex = np.abs(revenue * capex_pct)
+        delta_revenue = np.empty(len(projected_cols), dtype=float)
+        delta_revenue[0] = revenue[0] - hist_revenue
+        delta_revenue[1:] = revenue[1:] - revenue[:-1]
+        nwc = nwc_pct * delta_revenue
+
+        cash = _value(ws_data, ws, "D75", "Cash")
+        total_debt = _value(ws_data, ws, "D76", "Total debt")
+        preferred = _value(ws_data, ws, "D77", "Preferred stock")
+        minority = _value(ws_data, ws, "D78", "Minority interest")
+        shares = _value(ws_data, ws, "D82", "Shares outstanding")
+        current_price = _maybe_float(ws_data["D85"].value)
+        if current_price is None:
+            current_price = _maybe_float(op_data["U6"].value)
+        if current_price is None:
+            current_price = _require_float(op["U6"].value, "Current share price")
+        terminal_g = _value(ws_data, ws, "D58", "Terminal growth rate")
+        exit_multiple = _value(ws_data, ws, "D59", "Exit multiple")
+        tv_method = int(_value(ws_data, ws, "D64", "Terminal value method"))
+        discount_periods = _filled_series(52, "Discount periods")
+
+        wacc = _maybe_float(ws_data["D57"].value)
+        if wacc is None:
+            wacc = _maybe_float(ws["D57"].value)
+        if wacc is None:
+            market_cap = _value(op_data, op, "U11", "Market cap")
+            beta = _value(op_data, op, "U17", "Beta")
+            debt = _value(wacc_data, wacc_ws, "G15", "Debt")
+            risk_free = _value(wacc_data, wacc_ws, "G9", "Risk-free rate")
+            equity_risk_premium = _value(wacc_data, wacc_ws, "G12", "Equity risk premium")
+            tax_shield = _value(wacc_data, wacc_ws, "G18", "Tax rate for WACC")
+
+            cost_of_debt_value = wacc_data["G17"].value
+            if isinstance(cost_of_debt_value, (int, float)):
+                cost_of_debt = float(cost_of_debt_value)
+            else:
+                formula = str(wacc_ws["G17"].value or "")
+                if formula.startswith("=") and "/G15" in formula:
+                    interest_expense = float(formula[1:].split("/")[0])
+                    cost_of_debt = interest_expense / debt
+                else:
+                    raise ValueError("Cost of debt must be numeric or a simple interest-expense / debt formula")
+
+            total_capital = market_cap + debt
+            cost_of_equity = risk_free + beta * equity_risk_premium
+            wacc = (
+                market_cap / total_capital * cost_of_equity
+                + debt / total_capital * cost_of_debt * (1 - tax_shield)
+            )
+
+        data = {
+            "sheet_name": sheet_name,
+            "arrays": {
+                "Revenue": revenue,
+                "COGS": cogs,
+                "R&D": rd,
+                "SG&A": sga,
+                "D&A": da,
+                "CapEx": capex,
+                "Chg in NWC": nwc,
+                "Tax Rate": tax_rate,
+            },
+            "n_years": len(projected_cols),
+            "wacc": wacc,
+            "exit_multiple": exit_multiple,
+            "terminal_g": terminal_g,
+            "net_debt": total_debt + preferred + minority - cash,
+            "shares_outstanding": shares,
+            "current_price": current_price,
+            "exit_multiple_weight": 0.0 if tv_method == 1 else 1.0,
+            "discount_periods": discount_periods,
+            "shock_specs": read_projection_specs_from_excel(filepath),
+        }
+        data["target_price"] = run_base_dcf_from_imported_data(data)
+        wb_formula.close()
+        wb.close()
+        return data
     dcf = wb[sheet_name]
 
     n_years = 0
@@ -362,16 +524,23 @@ def read_dcf_from_excel(filepath: str = "model_inputs.xlsx") -> dict:
         raise KeyError("Imported DCF sheet must include a Revenue row")
     revenue = np.asarray(revenue, dtype=float)
 
-    def _expense_or_ratio(expense_name: str, ratio_name: str) -> np.ndarray:
+    def _expense_or_ratio(
+        expense_name: str,
+        ratio_name: str,
+        allow_missing: bool = False,
+    ) -> np.ndarray:
         absolute = _lookup_series(row_map, expense_name)
         ratio = _lookup_series(row_map, ratio_name)
         if absolute is not None:
             return np.abs(absolute)
         if ratio is not None:
             return revenue * np.clip(np.asarray(ratio, dtype=float), 0.0, 2.0)
+        if allow_missing:
+            return np.zeros(n_years, dtype=float)
         raise KeyError(f"Imported DCF sheet is missing {expense_name} or {ratio_name}")
 
     cogs = _expense_or_ratio("COGS", "COGS %")
+    rd = _expense_or_ratio("R&D", "R&D %", allow_missing=True)
     sga = _expense_or_ratio("SG&A", "SG&A %")
     da = _expense_or_ratio("D&A", "D&A %")
     capex = _expense_or_ratio("CapEx", "CapEx %")
@@ -399,6 +568,7 @@ def read_dcf_from_excel(filepath: str = "model_inputs.xlsx") -> dict:
         "arrays": {
             "Revenue": revenue,
             "COGS": cogs,
+            "R&D": rd,
             "SG&A": sga,
             "D&A": da,
             "CapEx": capex,
@@ -425,7 +595,29 @@ def read_inputs_from_excel(filepath: str = "model_inputs.xlsx") -> dict:
 
     When the real model arrives, just update INPUT_CELL_MAP references.
     """
-    wb = openpyxl.load_workbook(filepath, data_only=True)
+    wb = openpyxl.load_workbook(filepath, data_only=True, read_only=True)
+    if "Inputs" not in wb.sheetnames:
+        has_import_sheet = _find_import_sheet_name(wb) is not None
+        wb.close()
+        if not has_import_sheet:
+            raise KeyError("Workbook does not contain an Inputs sheet or an importable DCF sheet")
+
+        dcf_data = read_dcf_from_excel(filepath)
+        revenue = np.asarray(dcf_data["arrays"]["Revenue"], dtype=float)
+        return {
+            **DEFAULTS,
+            "revenue_base": float(revenue[0]) if revenue.size else DEFAULTS["revenue_base"],
+            "projection_years": int(dcf_data["n_years"]),
+            "exit_multiple": float(dcf_data["exit_multiple"]),
+            "terminal_g": float(dcf_data["terminal_g"]),
+            "wacc": float(dcf_data["wacc"]),
+            "net_debt": float(dcf_data["net_debt"]),
+            "shares_outstanding": float(dcf_data["shares_outstanding"]),
+            "exit_multiple_weight": float(dcf_data["exit_multiple_weight"]),
+            "current_price": float(dcf_data.get("current_price", DEFAULTS["current_price"])),
+            "fundamental_target": float(dcf_data.get("target_price", DEFAULTS["fundamental_target"])),
+        }
+
     inputs = {}
     for param, (sheet, cell) in INPUT_CELL_MAP.items():
         ws = wb[sheet]
@@ -440,6 +632,7 @@ def read_inputs_from_excel(filepath: str = "model_inputs.xlsx") -> dict:
 def write_results_to_excel(
     filepath: str = "model_inputs.xlsx",
     results: dict | None = None,
+    chart_paths: dict[str, Path | str] | None = None,
 ) -> None:
     """
     Write Monte Carlo output stats into a Results sheet.
@@ -449,6 +642,7 @@ def write_results_to_excel(
         n_iterations, n_valid, elapsed_seconds,
         sobol_df (optional pandas DataFrame)
     """
+    results = results or {}
     path = Path(filepath)
     if path.exists():
         wb = openpyxl.load_workbook(filepath)
@@ -460,52 +654,152 @@ def write_results_to_excel(
         del wb["Results"]
     ws = wb.create_sheet("Results")
 
-    # Header style
     bold = openpyxl.styles.Font(bold=True)
-    money_fmt = '#,##0.00'
+    title_font = openpyxl.styles.Font(bold=True, size=16)
+    section_font = openpyxl.styles.Font(bold=True, size=12, color="FFFFFF")
+    money_fmt = "$#,##0.00"
+    pct_fmt = "0.0%"
+    int_fmt = "#,##0"
+    section_fill = openpyxl.styles.PatternFill("solid", fgColor="1F4E78")
+    header_fill = openpyxl.styles.PatternFill("solid", fgColor="D9EAF7")
+    thin_side = openpyxl.styles.Side(style="thin", color="D0D7DE")
+    border = openpyxl.styles.Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
 
-    # ---- Summary statistics ----
-    ws["A1"] = "Monte Carlo Results"
-    ws["A1"].font = openpyxl.styles.Font(bold=True, size=14)
+    def _section_header(cell_ref: str, title: str) -> None:
+        ws[cell_ref] = title
+        ws[cell_ref].font = section_font
+        ws[cell_ref].fill = section_fill
 
-    stats_rows = [
-        ("Metric",              "Value"),
-        ("Mean Price ($)",      results.get("mean")),
-        ("Median Price ($)",    results.get("median")),
-        ("Std Dev ($)",         results.get("std")),
-        ("5th Percentile ($)",  results.get("p5")),
-        ("25th Percentile ($)", results.get("p25")),
-        ("50th Percentile ($)", results.get("p50")),
-        ("75th Percentile ($)", results.get("p75")),
-        ("95th Percentile ($)", results.get("p95")),
-        ("Iterations",          results.get("n_iterations")),
-        ("Valid Draws",         results.get("n_valid")),
-        ("Runtime (s)",         results.get("elapsed_seconds")),
+    def _write_two_col_table(start_row: int, title: str, rows: list[tuple[str, object]]) -> int:
+        _section_header(f"A{start_row}", title)
+        ws[f"A{start_row + 1}"] = "Metric"
+        ws[f"B{start_row + 1}"] = "Value"
+        ws[f"A{start_row + 1}"].font = bold
+        ws[f"B{start_row + 1}"].font = bold
+        ws[f"A{start_row + 1}"].fill = header_fill
+        ws[f"B{start_row + 1}"].fill = header_fill
+        current_row = start_row + 2
+        for label, value in rows:
+            ws[f"A{current_row}"] = label
+            ws[f"B{current_row}"] = value
+            current_row += 1
+        return current_row
+
+    def _apply_formats(cell_ref: str, label: str, value: object) -> None:
+        if value is None:
+            return
+        if isinstance(value, (int, float)):
+            if any(token in label for token in ("Price", "Percentile", "Target", "Mean", "Median", "Std Dev")):
+                ws[cell_ref].number_format = money_fmt
+            elif any(token in label for token in ("Upside", "Probability", "Percentile Rank")):
+                ws[cell_ref].number_format = pct_fmt
+            elif any(token in label for token in ("Iterations", "Draws", "Samples")):
+                ws[cell_ref].number_format = int_fmt
+
+    ws["A1"] = "Monte Carlo Valuation Dashboard"
+    ws["A1"].font = title_font
+    ws["A2"] = f"Workbook: {path.name}"
+    ws["A3"] = f"Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+    summary_rows = [
+        ("Current Price", results.get("current_price")),
+        ("Base DCF Target", results.get("target_price")),
+        ("Target Upside / Downside", results.get("target_upside")),
+        ("Monte Carlo Mean", results.get("mean")),
+        ("Monte Carlo Median", results.get("median")),
+        ("Monte Carlo Mean Upside / Downside", results.get("mean_upside")),
+        ("Std Dev", results.get("std")),
+        ("Probability Price > Current", results.get("prob_above_current")),
+        ("Current Price Percentile Rank", results.get("current_price_percentile")),
+        ("Iterations", results.get("n_iterations")),
+        ("Valid Draws", results.get("n_valid")),
+        ("Sobol Samples", results.get("sobol_samples")),
+        ("Runtime (s)", results.get("elapsed_seconds")),
     ]
-    for i, (label, val) in enumerate(stats_rows, start=3):
-        ws[f"A{i}"] = label
-        ws[f"B{i}"] = val
-        if i == 3:
-            ws[f"A{i}"].font = bold
-            ws[f"B{i}"].font = bold
-        elif val is not None and isinstance(val, float) and "Price" in label:
-            ws[f"B{i}"].number_format = money_fmt
+    percentiles_rows = [
+        ("5th Percentile", results.get("p5")),
+        ("25th Percentile", results.get("p25")),
+        ("50th Percentile", results.get("p50")),
+        ("75th Percentile", results.get("p75")),
+        ("95th Percentile", results.get("p95")),
+    ]
+    next_row = _write_two_col_table(5, "Summary", summary_rows)
+    next_row = _write_two_col_table(next_row + 1, "Distribution Percentiles", percentiles_rows)
 
-    # ---- Sobol sensitivity (if provided) ----
+    for row in range(6, next_row):
+        for col in ("A", "B"):
+            ws[f"{col}{row}"].border = border
+            if col == "B":
+                _apply_formats(f"{col}{row}", str(ws[f"A{row}"].value or ""), ws[f"{col}{row}"].value)
+
     sobol_df = results.get("sobol_df")
     if sobol_df is not None:
-        start_row = 17
-        ws[f"A{start_row}"] = "Sobol Sensitivity"
-        ws[f"A{start_row}"].font = openpyxl.styles.Font(bold=True, size=12)
-        start_row += 1
-        for j, col in enumerate(sobol_df.columns):
-            ws.cell(row=start_row, column=j + 1, value=col).font = bold
-        for i, row_data in enumerate(sobol_df.itertuples(index=False), start=start_row + 1):
-            for j, val in enumerate(row_data):
-                ws.cell(row=i, column=j + 1, value=val)
+        start_col = 4
+        start_row = 5
+        ws.cell(row=start_row, column=start_col, value="Sensitivity Ranking").font = section_font
+        ws.cell(row=start_row, column=start_col).fill = section_fill
+        for offset, header in enumerate(sobol_df.columns, start=0):
+            cell = ws.cell(row=start_row + 1, column=start_col + offset, value=header)
+            cell.font = bold
+            cell.fill = header_fill
+            cell.border = border
+        for row_idx, row_data in enumerate(sobol_df.itertuples(index=False), start=start_row + 2):
+            for col_idx, value in enumerate(row_data, start=start_col):
+                cell = ws.cell(row=row_idx, column=col_idx, value=value)
+                cell.border = border
+                if isinstance(value, float) and sobol_df.columns[col_idx - start_col] != "Parameter":
+                    cell.number_format = "0.000"
 
-    ws.column_dimensions["A"].width = 25
-    ws.column_dimensions["B"].width = 15
+    tornado_df = results.get("tornado_df")
+    if tornado_df is not None:
+        start_col = 4
+        start_row = 20
+        tornado_cols = ["Label", "Shock Used", "Bear Delta", "Bull Delta", "Bear Price", "Bull Price"]
+        ws.cell(row=start_row, column=start_col, value="Tornado Sensitivity ($/share)").font = section_font
+        ws.cell(row=start_row, column=start_col).fill = section_fill
+        for offset, header in enumerate(tornado_cols, start=0):
+            cell = ws.cell(row=start_row + 1, column=start_col + offset, value=header)
+            cell.font = bold
+            cell.fill = header_fill
+            cell.border = border
+        for row_idx, row_data in enumerate(tornado_df[tornado_cols].itertuples(index=False), start=start_row + 2):
+            for col_idx, value in enumerate(row_data, start=start_col):
+                cell = ws.cell(row=row_idx, column=col_idx, value=value)
+                cell.border = border
+                if isinstance(value, float):
+                    cell.number_format = money_fmt
+
+    if chart_paths:
+        image_specs = [
+            ("distribution", "J2", 880, 460),
+            ("percentiles", "J28", 640, 320),
+            ("sobol", "J46", 820, 420),
+            ("tornado", "J70", 860, 460),
+        ]
+        for key, anchor, width, height in image_specs:
+            image_path = chart_paths.get(key)
+            if image_path is None:
+                continue
+            image_file = Path(image_path)
+            if not image_file.exists():
+                continue
+            image = ExcelImage(str(image_file))
+            image.width = width
+            image.height = height
+            ws.add_image(image, anchor)
+
+    ws.freeze_panes = "A6"
+    for column, width in {
+        "A": 34,
+        "B": 18,
+        "D": 24,
+        "E": 16,
+        "F": 14,
+        "G": 14,
+        "H": 14,
+        "I": 14,
+    }.items():
+        ws.column_dimensions[column].width = width
 
     wb.save(filepath)
     print(f"  Results written to: {filepath} [Results sheet]")

@@ -198,6 +198,7 @@ class ProjectionShockSpec:
 DEFAULT_PROJECTION_SPECS: list[ProjectionShockSpec] = [
     ProjectionShockSpec("revenue", "Revenue", "relative", 0.05, 0.25, 2.50, True),
     ProjectionShockSpec("cogs_pct", "COGS %", "additive", 0.020, 0.05, 0.95, True),
+    ProjectionShockSpec("rd_pct", "R&D %", "additive", 0.010, 0.00, 0.25, True),
     ProjectionShockSpec("sga_pct", "SG&A %", "additive", 0.015, 0.01, 0.60, True),
     ProjectionShockSpec("da_pct", "D&A %", "additive", 0.010, 0.00, 0.25, True),
     ProjectionShockSpec("tax_rate", "Tax Rate", "additive", 0.015, 0.00, 0.45, True),
@@ -402,7 +403,9 @@ def build_projection_correlation_matrix(
 
     _set("revenue", "wacc", 0.25)
     _set("revenue", "exit_multiple", 0.15)
-    _set("cogs_pct", "sga_pct", 0.25)
+    _set("cogs_pct", "rd_pct", 0.15)
+    _set("cogs_pct", "sga_pct", 0.20)
+    _set("rd_pct", "sga_pct", 0.25)
     _set("da_pct", "capex", 0.30)
     _set("wacc", "exit_multiple", -0.35)
     _set("wacc", "terminal_g", 0.15)
@@ -426,6 +429,7 @@ def _projection_base_values(dcf_data: dict) -> dict[str, NDArray | float]:
     return {
         "revenue": revenue,
         "cogs_pct": np.asarray(arrays["COGS"], dtype=float) / denom,
+        "rd_pct": np.asarray(arrays["R&D"], dtype=float) / denom,
         "sga_pct": np.asarray(arrays["SG&A"], dtype=float) / denom,
         "da_pct": np.asarray(arrays["D&A"], dtype=float) / denom,
         "tax_rate": np.asarray(arrays["Tax Rate"], dtype=float),
@@ -456,16 +460,24 @@ def _projection_dcf_from_draws(
 ) -> NDArray:
     revenue = draws["revenue"]
     cogs = revenue * draws["cogs_pct"]
+    rd = revenue * draws["rd_pct"]
     sga = revenue * draws["sga_pct"]
     da = revenue * draws["da_pct"]
 
-    ebitda = revenue - cogs - sga
-    ebit = ebitda - da
+    # In the imported workbook layout, gross margin and opex margins are based on
+    # reported operating income structure, so D&A is treated as a cash-flow add-back
+    # rather than a separately forecast operating expense line.
+    ebit = revenue - cogs - rd - sga
+    ebitda = ebit + da
     nopat = ebit * (1 - draws["tax_rate"])
     fcff = nopat + da - draws["capex"] - draws["nwc"]
 
     n_years = revenue.shape[1]
-    discount_exp = np.arange(1, n_years + 1)[np.newaxis, :]
+    discount_periods = np.asarray(
+        dcf_data.get("discount_periods", np.arange(1, n_years + 1)),
+        dtype=float,
+    )
+    discount_exp = discount_periods[np.newaxis, :]
     discount_factors = (1 + draws["wacc"][:, np.newaxis]) ** discount_exp
     pv_fcff = np.sum(fcff / discount_factors, axis=1)
 
@@ -494,6 +506,7 @@ def run_dcf_from_projections(
     net_debt: float = 2_000.0,
     shares: float = 500.0,
     exit_multiple_weight: float = 0.50,
+    discount_periods: NDArray | None = None,
 ) -> float:
     """
     Deterministic DCF from a pre-computed FCFF array.
@@ -501,7 +514,9 @@ def run_dcf_from_projections(
     Used as the inner loop for the projection-based Monte Carlo.
     """
     n_years = len(fcff_array)
-    discount_factors = (1 + wacc) ** np.arange(1, n_years + 1)
+    if discount_periods is None:
+        discount_periods = np.arange(1, n_years + 1)
+    discount_factors = (1 + wacc) ** np.asarray(discount_periods, dtype=float)
     pv_fcff = np.sum(fcff_array / discount_factors)
 
     tv_exit = last_ebitda * exit_multiple
@@ -518,7 +533,7 @@ def run_base_dcf_from_imported_data(dcf_data: dict) -> float:
     """Deterministic valuation of the imported DCF case with no stochastic shocks."""
     base = _projection_base_values(dcf_data)
     draws = {}
-    for name in ("revenue", "cogs_pct", "sga_pct", "da_pct", "tax_rate", "capex", "nwc"):
+    for name in ("revenue", "cogs_pct", "rd_pct", "sga_pct", "da_pct", "tax_rate", "capex", "nwc"):
         draws[name] = np.asarray(base[name], dtype=float)[np.newaxis, :]
     for name in ("wacc", "exit_multiple", "terminal_g"):
         draws[name] = np.array([float(base[name])], dtype=float)
